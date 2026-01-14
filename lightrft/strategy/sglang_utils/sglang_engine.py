@@ -184,7 +184,19 @@ class RLGenerationEngine:
                 input_ids = gather_inputs_object_for_inference(input_ids, group=self.tp_group_cpu)
             if image_data is not None:
                 image_data = gather_inputs_object_for_inference(image_data, group=self.tp_group_cpu)
+        
         if self._tp_rank == 0:
+
+            # print(f"rank {dist.get_rank()} input_ids:{input_ids}")
+            # # 在本文件开始，通过全局变量来控制是否处于调试状态
+            # global DEBUG_ENABLED;DEBUG_ENABLED = True 
+            # if dist.get_rank() == 0 and DEBUG_ENABLED:
+            #     print(f"rank {dist.get_rank()} 进入调试模式，输入interact，可以键入整段的python代码调试。通过设置 DEBUG_ENABLED = False, 可以跳过调试状态")
+            #     import ipdb; ipdb.set_trace()
+            # # 同步点，防止其它进程早跑
+            # dist.barrier()
+
+
             output = self._engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -203,10 +215,16 @@ class RLGenerationEngine:
             # Most naive implementation, can extract tensor and send via gloo if too slow
             # Try to use force_cpu_device parameter if available (sglang>=0.4.6)
             # Otherwise, fall back to calling without it for older versions
+
+            # IMPORTANT: broadcast_pyobj expects global rank, not local rank within group
+            global_rank = dist.get_rank()
+
+
             try:
                 [output] = broadcast_pyobj(
                     data=[output],
-                    rank=self._tp_rank,
+                    # rank=self._tp_rank,
+                    rank=global_rank,
                     dist_group=self.tp_group_cpu,
                     src=self._leader_rank,
                     force_cpu_device=True,
@@ -215,7 +233,8 @@ class RLGenerationEngine:
                 # Older versions don't support force_cpu_device parameter
                 [output] = broadcast_pyobj(
                     data=[output],
-                    rank=self._tp_rank,
+                    # rank=self._tp_rank,
+                    rank=global_rank,
                     dist_group=self.tp_group_cpu,
                     src=self._leader_rank,
                 )

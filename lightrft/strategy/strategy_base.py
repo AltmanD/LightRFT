@@ -771,18 +771,38 @@ class StrategyBase(ABC):
                 ) for output in vllm_outputs
             ]
         elif self.inference_engine_type == "sglang":
+
+
+
             if multi_modal_inputs is not None:  # VLM case
+                # print(f"multi_modal_inputs:{multi_modal_inputs}")
+
                 prompt = [p["prompt"] for p in multi_modal_inputs]
-                image = [p["multi_modal_data"]["image"] for p in multi_modal_inputs]
+                
+                # image = [p["multi_modal_data"]["image"] for p in multi_modal_inputs]
+
+                # Handle cases where some prompts might not have images
+                # Flatten nested list format if needed: [[PIL.Image]] -> [PIL.Image]
+                image = [
+                    (img[0] if isinstance(img, list) and len(img) > 0 else img)
+                    for img in (p.get("multi_modal_data", {}).get("image") for p in multi_modal_inputs)
+                ]
+
+                sglang_outputs = self.inference_engine.generate(
+                    sampling_params=sampling_params,
+                    # input_ids=prompt,
+                    prompt=prompt, # skip_tokenizer_init: bool = False
+                    image_data=image,
+                )
             else:
                 prompt = prompt_token_ids
                 image = None
 
-            sglang_outputs = self.inference_engine.generate(
-                sampling_params=sampling_params,
-                input_ids=prompt,
-                image_data=image,
-            )
+                sglang_outputs = self.inference_engine.generate(
+                    sampling_params=sampling_params,
+                    input_ids=prompt,
+                    image_data=image,
+                )
             return [
                 EasyDict(
                     prompt_token_ids=prompt[i],
@@ -842,7 +862,10 @@ class StrategyBase(ABC):
             raise NotImplementedError("Inference engine is not initialized.")
         self.wakeup_inference_engine()
 
-        is_multimodal = all_images is not None
+        # is_multimodal = all_images is not None
+       # 修复逻辑：不仅检查 all_images 是否为 None，还要检查其中是否包含非 None 的元素
+        # 如果 all_images 是 [None, None, ...]，any(img is not None for img in all_images) 将返回 False
+        is_multimodal = (all_images is not None) and any(img is not None for img in all_images)
 
         if is_multimodal:
             inputs = self._build_multimodal_inputs(
@@ -851,6 +874,15 @@ class StrategyBase(ABC):
         else:
             inputs = all_prompt_token_ids
             assert inputs is not None
+
+        # 在本文件开始，通过全局变量来控制是否处于调试状态
+        # global DEBUG_ENABLED;DEBUG_ENABLED = True 
+        # import torch.distributed as dist
+        # if dist.get_rank() == 0 and DEBUG_ENABLED:
+        #     print(f"rank {dist.get_rank()} 进入调试模式，输入interact，可以键入整段的python代码调试。通过设置 DEBUG_ENABLED = False, 可以跳过调试状态")
+        #     import ipdb; ipdb.set_trace()
+        # # 同步点，防止其它进程早跑
+        # dist.barrier()
 
         inputs = gather_inputs_object_for_inference(input_data=inputs, group=self.engine_mp_group)
 
