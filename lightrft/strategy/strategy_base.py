@@ -787,7 +787,7 @@ class StrategyBase(ABC):
                 sglang_outputs = self.inference_engine.generate(
                     sampling_params=sampling_params,
                     # input_ids=prompt,
-                    prompt=prompt, # skip_tokenizer_init: bool = False
+                    prompt=prompt, # skip_tokenizer_init must be False
                     image_data=image,
                 )
             else: # text-only case
