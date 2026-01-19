@@ -362,12 +362,19 @@ class RLGenerationEngine:
                 )
                 tags = [GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
 
-            # Import required classes
-            from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
+            # --- 修改开始 ---
+            # 不需要导入 ReleaseMemoryOccupationReqInput
+            # 不需要创建 req 对象
+            # 直接将 tags 传给 engine
+            self._engine.release_memory_occupation(tags=tags)
+            # --- 修改结束 ---
 
-            # Create request with specified tags
-            req = ReleaseMemoryOccupationReqInput(tags=tags)
-            self._engine.release_memory_occupation(req)
+            # # Import required classes
+            # from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
+
+            # # Create request with specified tags
+            # req = ReleaseMemoryOccupationReqInput(tags=tags)
+            # self._engine.release_memory_occupation(req)
 
     def wake_up(self, release_weights: bool = False):
         """
@@ -410,12 +417,19 @@ class RLGenerationEngine:
                 )
                 tags = [GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
 
-            # Import required classes
-            from sglang.srt.managers.io_struct import ResumeMemoryOccupationReqInput
+            # --- 修改开始 ---
+            # 不需要导入 ResumeMemoryOccupationReqInput
+            # 不需要创建 req 对象
+            # 直接将 tags 传给 engine
+            self._engine.resume_memory_occupation(tags=tags)
+            # --- 修改结束 ---
 
-            # Create request with specified tags
-            req = ResumeMemoryOccupationReqInput(tags=tags)
-            self._engine.resume_memory_occupation(req)
+            # # Import required classes
+            # from sglang.srt.managers.io_struct import ResumeMemoryOccupationReqInput
+
+            # # Create request with specified tags
+            # req = ResumeMemoryOccupationReqInput(tags=tags)
+            # self._engine.resume_memory_occupation(req)
 
     def shutdown(self):
         """

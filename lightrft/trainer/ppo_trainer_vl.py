@@ -208,6 +208,7 @@ class PPOTrainerVL(ABC):
         self._wandb = None
         self._tensorboard = None
         self.eval_step_counter = 0  # Independent counter for eval X-axis
+        self.wandb_log_counter = 0  # Global counter for unique wandb system steps
 
         if self.strategy.args.use_wandb and self.strategy.is_rank_0():
             import wandb
@@ -1041,10 +1042,10 @@ class PPOTrainerVL(ABC):
                     for k, v in self.experience_maker.perf_stats.items():
                         all_wandb_logs[f"perf/experience_maker/{k}"] = v
 
-                # Commit Train/Rollout logs
+                # Commit Train/Rollout logs with unique system step
                 if all_wandb_logs:
-                    # IMPORTANT: Use global_step as the system step to keep timeline consistent
-                    self._wandb.log(all_wandb_logs, step=global_step, commit=True)
+                    self.wandb_log_counter += 1
+                    self._wandb.log(all_wandb_logs, step=self.wandb_log_counter, commit=True)
 
             # TensorBoard Logging
             elif self._tensorboard is not None and self.strategy.is_rank_0():
@@ -1073,15 +1074,15 @@ class PPOTrainerVL(ABC):
                     # Custom X-axis for Eval
                     eval_logs["eval/global_step"] = self.eval_step_counter
                     # Reference to main training step
-                    eval_logs["eval/train_step"] = global_step 
+                    eval_logs["eval/train_step"] = global_step
                     eval_logs["eval/episode"] = episode
 
-                    # IMPORTANT: 
-                    # 1. We use `commit=True` to ensure this is a separate row in DB.
-                    # 2. We use `step=global_step` (NOT eval_step_counter) for the system step.
-                    #    This prevents the UI timeline from jumping back to "1" when we are at step "1000".
-                    #    The plots will still use `eval/global_step` as X-axis because we defined it in __init__.
-                    self._wandb.log(eval_logs, step=global_step, commit=True)
+                    # IMPORTANT:
+                    # Use wandb_log_counter to ensure eval has a unique system step
+                    # This prevents eval metrics from being overwritten by train metrics
+                    # The plots will still use eval/global_step as X-axis due to define_metric
+                    self.wandb_log_counter += 1
+                    self._wandb.log(eval_logs, step=self.wandb_log_counter, commit=True)
 
                 # TensorBoard Logging for Eval
                 elif self._tensorboard is not None:
