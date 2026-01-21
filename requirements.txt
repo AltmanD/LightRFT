@@ -20,3 +20,5 @@ nltk
 mathruler
 loguru
 librosa
+qwen-vl-utils
+sympy
