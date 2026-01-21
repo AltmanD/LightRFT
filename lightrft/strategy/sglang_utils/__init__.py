@@ -92,11 +92,13 @@ def get_sglang_engine(
     :type enable_engine_sleep: bool
     :param tp_size: Tensor parallelism size for distributed inference
     :type tp_size: int
-    :param skip_tokenizer_init: Whether to skip tokenizer initialization for faster startup
+    :param skip_tokenizer_init: Whether to skip tokenizer initialization for faster startup.
+                                Defaults to False as the tokenizer is needed to process
+                                text inputs (required for VLM use cases)
     :type skip_tokenizer_init: bool
     :param dtype: Data type for model weights and computations ("bfloat16" or "float16")
     :type dtype: str
-    :param disable_cuda_graph: Whether to disable CUDA graph optimization
+    :param disable_cuda_graph: Whether to disab《》le CUDA graph optimization
     :type disable_cuda_graph: bool
 
     :return: Configured RLGenerationEngine instance ready for distributed inference

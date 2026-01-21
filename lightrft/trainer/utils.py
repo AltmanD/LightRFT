@@ -7,6 +7,7 @@ The main components are:
 - compute_clip_fraction: Calculates the fraction of tensor elements that fall outside specified bounds
 - RunningMoments: Maintains running mean and standard deviation statistics for streaming data
 - get_cpgd_advantages_returns: Computes advantages and returns for CPGD algorithm
+- vllm_ge_0130: Version checking utility for vLLM compatibility
 
 These utilities are particularly useful in RL algorithms like PPO where clipping statistics and
 normalization are important for training stability and monitoring.
@@ -16,6 +17,11 @@ import copy
 import torch
 from copy import deepcopy
 from typing import Callable, List, Tuple, Union, Optional
+
+try:
+    import vllm
+except ImportError:
+    vllm = None
 
 
 def fire_sampling(
@@ -352,3 +358,25 @@ def get_cpgd_advantages_returns(
     returns = deepcopy(scores)
 
     return advantages, returns
+
+
+def vllm_ge_0130():
+    """
+    Check if vLLM version is greater than or equal to 0.13.0.
+
+    Starting from vLLM 0.13.0, truncate_prompt_tokens parameter must not exceed
+    max_model_len, requiring additional validation logic.
+
+    :return: True if vLLM version >= 0.13.0, False otherwise
+    :rtype: bool
+    """
+    if vllm is None:
+        # If vLLM is not installed, assume newer version for safety
+        return True
+
+    try:
+        version_digits = int("".join(list(filter(str.isdigit, vllm.__version__))))
+        return version_digits >= 130
+    except (AttributeError, ValueError):
+        # If version cannot be determined, assume newer version for safety
+        return True

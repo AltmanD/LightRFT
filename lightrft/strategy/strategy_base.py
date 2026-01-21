@@ -813,11 +813,10 @@ class StrategyBase(ABC):
                 ]
             else:  # text-only case
                 logger.debug(f"rank {dist.get_rank()} text-only branch")
-                image = None
                 sglang_outputs = self.inference_engine.generate(
                     sampling_params=sampling_params,
                     input_ids=prompt_token_ids,
-                    image_data=image,
+                    image_data=None,
                 )
                 # Text-only case: prompt_token_ids is available from input
                 return [
@@ -959,7 +958,11 @@ class StrategyBase(ABC):
         # is_multimodal = all_images is not None
         # NOTE: not only check if all_images is None, but also check if it contains non-None elements
         # If all_images is [None, None, ...], any(img is not None for img in all_images) will return False
-        is_multimodal = (all_images is not None) and any(img is not None for img in all_images)
+        # Same logic applies to all_videos
+        is_multimodal = (
+            ((all_images is not None) and any(img is not None for img in all_images))
+            or ((all_videos is not None) and any(vid is not None for vid in all_videos))
+        )
 
         if is_multimodal:
             inputs = self._build_multimodal_inputs(

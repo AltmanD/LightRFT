@@ -110,7 +110,12 @@ class BroadcastManager:
                 if self.strategy.engine_type == "vllm":
                     self.inference_engine.llm_engine.model_executor.collective_rpc("update_weight", kwargs=kwargs)
                 elif self.strategy.engine_type == "sglang":
-                    if not self.strategy.args.text_only:
+                    if self.strategy.args.text_only:
+                        # for LLM
+                        self.inference_engine.update_weights_from_tensor(
+                            name, param.data, flush_cache=(count == num_params)
+                        )
+                    else:
                         # for VLM
                         # Map weight names from training model to SGLang format
                         # Training model: model.visual.xxx, model.language_model.xxx
@@ -119,11 +124,7 @@ class BroadcastManager:
                         self.inference_engine.update_weights_from_tensor(
                             sglang_name, param.data, flush_cache=(count == num_params)
                         )
-                    else:
-                        # for LLM
-                        self.inference_engine.update_weights_from_tensor(
-                            name, param.data, flush_cache=(count == num_params)
-                        )
+
 
     def _fsdp_v2_broadcast(self):
         """
@@ -156,7 +157,12 @@ class BroadcastManager:
                 )
                 self.inference_engine.llm_engine.model_executor.collective_rpc("update_weight", kwargs=kwargs)
             elif self.strategy.engine_type == "sglang":
-                if not self.strategy.args.text_only:
+                if self.strategy.args.text_only:
+                    # for LLM
+                    self.inference_engine.update_weights_from_tensor(
+                        name, param.data, flush_cache=(count == num_params)
+                    )
+                else:
                     # for VLM
                     # Map weight names from training model to SGLang format
                     # Training model: model.visual.xxx, model.language_model.xxx
@@ -165,11 +171,7 @@ class BroadcastManager:
                     self.inference_engine.update_weights_from_tensor(
                         sglang_name, param.data, flush_cache=(count == num_params)
                     )
-                else:
-                    # for LLM
-                    self.inference_engine.update_weights_from_tensor(
-                        name, param.data, flush_cache=(count == num_params)
-                    )
+
             del param_on_device
             del full_param
 

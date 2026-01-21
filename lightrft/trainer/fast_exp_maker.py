@@ -53,9 +53,10 @@ from lightrft.trainer.experience_maker_vl import (
 
 from lightrft.utils.remote_rm_utils import remote_rm_fn
 from lightrft.utils import Timer, get_current_device
-from .utils import RunningMoments, compute_clip_fraction, get_cpgd_advantages_returns, fire_sampling
+from .utils import RunningMoments, compute_clip_fraction, get_cpgd_advantages_returns, fire_sampling, vllm_ge_0130
 from .image_utils import normalize_images, get_images_num
 from .video_utils import normalize_videos, get_videos_num
+
 
 # ============================================================================
 # Data Structures
@@ -1093,11 +1094,13 @@ class FastExperienceMaker(NaiveExperienceMaker):
 
         # ========== Configure Sampling Parameters ==========
         if config.engine_type == "vllm":
-            # Get max_model_len from vLLM engine to ensure truncate_prompt_tokens doesn't exceed it
-            # This is required for vllm>=0.13.0 which validates truncate_prompt_tokens <= max_model_len
-            max_model_len = self.strategy.inference_engine.llm_engine.model_config.max_model_len
-            # Use the minimum of 8192 and max_model_len to avoid validation errors
-            truncate_tokens = min(8192, max_model_len)
+            # For vllm>=0.13.0, truncate_prompt_tokens must not exceed max_model_len
+            # For older versions, we can use 8192 directly without validation
+            if vllm_ge_0130():
+                max_model_len = self.strategy.inference_engine.llm_engine.model_config.max_model_len
+                truncate_tokens = min(8192, max_model_len)
+            else:
+                truncate_tokens = 8192
 
             sampling_params = SamplingParams(
                 temperature=generate_kwargs.get("temperature", 1.0),
