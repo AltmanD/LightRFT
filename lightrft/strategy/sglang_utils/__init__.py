@@ -1,6 +1,6 @@
 """
 This module provides functionality for initializing and configuring a SGLang generation engine
-for reinforcement learning with human feedback (RLHF) applications. It handles distributed
+for RLHF and RLVR applications. It handles distributed
 training setup, device coordination, and engine initialization with appropriate parameters.
 
 The main component is the get_sglang_engine function which creates and returns a configured
@@ -12,9 +12,6 @@ import datetime
 import os
 import sys
 
-# Standard library imports
-
-# Third-party library imports
 import torch
 
 # Local application imports
@@ -98,7 +95,7 @@ def get_sglang_engine(
     :type skip_tokenizer_init: bool
     :param dtype: Data type for model weights and computations ("bfloat16" or "float16")
     :type dtype: str
-    :param disable_cuda_graph: Whether to disab《》le CUDA graph optimization
+    :param disable_cuda_graph: Whether to disable CUDA graph optimization
     :type disable_cuda_graph: bool
 
     :return: Configured RLGenerationEngine instance ready for distributed inference

@@ -959,10 +959,8 @@ class StrategyBase(ABC):
         # NOTE: not only check if all_images is None, but also check if it contains non-None elements
         # If all_images is [None, None, ...], any(img is not None for img in all_images) will return False
         # Same logic applies to all_videos
-        is_multimodal = (
-            ((all_images is not None) and any(img is not None for img in all_images))
-            or ((all_videos is not None) and any(vid is not None for vid in all_videos))
-        )
+        is_multimodal = (((all_images is not None) and any(img is not None for img in all_images))
+                         or ((all_videos is not None) and any(vid is not None for vid in all_videos)))
 
         if is_multimodal:
             inputs = self._build_multimodal_inputs(

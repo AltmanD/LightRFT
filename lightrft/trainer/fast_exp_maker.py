@@ -57,7 +57,6 @@ from .utils import RunningMoments, compute_clip_fraction, get_cpgd_advantages_re
 from .image_utils import normalize_images, get_images_num
 from .video_utils import normalize_videos, get_videos_num
 
-
 # ============================================================================
 # Data Structures
 # ============================================================================
