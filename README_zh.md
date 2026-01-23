@@ -92,9 +92,9 @@
 
 ### 环境要求
 
-- Python >= 3.10
+- Python >= 3.12
 - CUDA >= 12.8
-- PyTorch >= 2.5.1
+- PyTorch >= 2.9.1
 
 ### Docker 镜像
 
@@ -347,6 +347,12 @@ make docs
 make docs-live
 # 访问 http://localhost:8000
 ```
+
+
+## 开发计划
+
+- [v0.1.2](https://github.com/opendilab/LightRFT/issues/28)
+- [v0.1.1](https://github.com/opendilab/LightRFT/issues/19)
 
 
 ## 🤝 贡献指南

@@ -92,9 +92,9 @@ For detailed algorithm descriptions, implementation details, and usage guide, se
 
 ### Requirements
 
-- Python >= 3.10
+- Python >= 3.12
 - CUDA >= 12.8
-- PyTorch >= 2.5.1
+- PyTorch >= 2.9.1
 
 ### Docker Images
 
@@ -348,6 +348,12 @@ Live documentation preview:
 make docs-live
 # Visit http://localhost:8000
 ```
+
+## Roadmap
+
+- [v0.1.2](https://github.com/opendilab/LightRFT/issues/28)
+- [v0.1.1](https://github.com/opendilab/LightRFT/issues/19)
+
 
 ## 🤝 Contributing
 
