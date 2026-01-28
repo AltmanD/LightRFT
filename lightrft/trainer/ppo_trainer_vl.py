@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from lightrft.models import ActorVL, GPTLMLoss, PolicyLoss, ValueLoss
+from lightrft.models.actor_modality import ActorModality, get_supported_parameters
 from lightrft.models.utils import masked_mean, unpacking_samples, compute_approx_kl
 from lightrft.utils.distributed_sampler import DistributedSampler
 from lightrft.trainer import AdaptiveKLController, ExperienceVL, FixedKLController, NaiveExperienceMakerVL, NaiveReplayBufferVL  # noqa
@@ -171,6 +172,11 @@ class PPOTrainerVL(ABC):
         self.critic_optim = critic_optim
         self.actor_scheduler = actor_scheduler
         self.critic_scheduler = critic_scheduler
+
+        # Cache actor's supported parameters based on its modality
+        # Default to VISION_LANGUAGE for backward compatibility with models without modality attribute
+        actor_modality = self.actor.modality
+        self._actor_supported_params = get_supported_parameters(actor_modality)
 
         self.actor_loss_fn = PolicyLoss(eps_clip, use_cpg_loss=self.args.use_cpg_loss)
 
@@ -723,16 +729,23 @@ class PPOTrainerVL(ABC):
             return {}  # Emergency fallback - should not normally execute
 
         # Actor loss
+        # Build kwargs based on actor's modality - only include supported parameters
+        candidate_params = {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thws,
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thws,
+        }
+
+        actor_kwargs = {key: value for key, value in candidate_params.items() if key in self._actor_supported_params}
+
         action_log_probs, output = self.actor(
             sequences,
             num_actions,
             attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thws,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thws,
             return_output=True,
             packed_seq_lens=packed_seq_lens,
+            **actor_kwargs
         )
 
         # NOTE: Explicit masking in log-space is incorrect - removed

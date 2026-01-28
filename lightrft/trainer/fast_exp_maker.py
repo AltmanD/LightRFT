@@ -41,6 +41,7 @@ from lightrft.models.utils import (
     masked_mean,
     unpacking_samples,
 )
+from lightrft.models.actor_modality import ActorModality, get_supported_parameters
 from lightrft.trainer.experience_maker import (
     Experience,
     NaiveExperienceMaker,
@@ -250,6 +251,13 @@ class MultimodalDataProcessor:
             all_prompt_token_ids_text = inputs_text["input_ids"]
         else:
             all_prompt_token_ids_text = []
+
+        # Initialize multimodal variables for text-only compatibility
+        all_prompt_token_ids_multimodal = []
+        all_images_pixel_values_multimodal = None
+        all_videos_pixel_values_multimodal = None
+        all_images_grid_thw_multimodal = None
+        all_videos_grid_thw_multimodal = None
 
         # ===== Stage 3-B: Multimodal processing =====
         if len(all_prompts_multimodal) > 0:
@@ -927,6 +935,11 @@ class FastExperienceMaker(NaiveExperienceMaker):
             strategy=self.strategy,
             packing_samples=self.packing_samples,
         )
+
+        # Cache actor's supported parameters based on its modality
+        # Default to VISION_LANGUAGE for backward compatibility with models without modality attribute
+        actor_modality = self.actor.modality
+        self._actor_supported_params = get_supported_parameters(actor_modality)
 
     # ========================================================================
     # Public API Methods
@@ -1636,15 +1649,24 @@ class FastExperienceMaker(NaiveExperienceMaker):
         references = sample.references
         output_texts = getattr(sample, "output_texts", None)
 
-        # Build extra kwargs for VLM
+        # Build extra kwargs for VLM based on actor's modality
+        # Only include parameters that the actor's modality supports
         extra_kwargs = {}
         if vlm:
-            extra_kwargs = dict(
-                pixel_values=sample.pixel_values,
-                image_grid_thw=sample.image_grid_thws,
-                pixel_values_videos=sample.pixel_values_videos,
-                video_grid_thw=sample.video_grid_thws,
-            )
+            # Candidate parameters to pass
+            candidate_params = {
+                "pixel_values": sample.pixel_values,
+                "image_grid_thw": sample.image_grid_thws,
+                "pixel_values_videos": sample.pixel_values_videos,
+                "video_grid_thw": sample.video_grid_thws,
+            }
+
+            # Filter to only include supported parameters
+            extra_kwargs = {
+                key: value
+                for key, value in candidate_params.items()
+                if key in self._actor_supported_params
+            }
 
         # Fix Qwen-VL image token count bug
         self._fix_qwen_vl_image_tokens(sequences, sample, vlm)
