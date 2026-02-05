@@ -1,14 +1,50 @@
 """
-PartialFastExperienceMaker – FastExperienceMaker with partial rollout and token‑budget regeneration.
+PartialFastExperienceMaker Module – FastExperienceMaker with Partial Rollout and Token‑Budget Regeneration.
 
-This subclass adds two key features:
-  1. Partial rollout: only a fraction (partial_percent) of the total rollout batch is generated
-     in each call; the rest is kept in buffers.
-  2. Token‑budget regeneration: samples whose generation reaches max_token_budget are flagged
-     and can be regenerated later (e.g., for continuing long‑form tasks).
+This module extends FastExperienceMaker to support incremental rollout and controlled generation
+for long‑form or high‑cost tasks. It introduces two core mechanisms:
+   1. Partial rollout: only a fraction (partial_percent) of the total rollout batch is generated
+      in each call; the remaining samples are kept in buffers for subsequent steps, reducing
+      per‑iteration latency and enabling smoother pipeline scheduling.
+   2. Token‑budget regeneration: samples that reach a predefined token budget (max_token_budget)
+      are flagged and can be regenerated later, allowing continuation of long‑form generation
+      without discarding already‑produced content.
 
 The class reuses the parent's infrastructure (MultimodalDataProcessor, RewardComputationEngine,
 etc.) and only overrides the methods that implement the partial‑rollout logic.
+
+Implementation Overview:
+    - The rollout batch is split into "regeneration" and "non‑regeneration" buffers based on
+      whether a sample has exhausted its token budget.
+    - The method `need_new_prompts` determines whether fresh prompts are required to fill the
+      partial batch.
+    - Generation is performed via the parent's inference engine (VLLM/SGLang), but outputs are
+      post‑processed to respect the token budget and partial fraction.
+    - Advantage estimation methods (RLOO, Group Norm, REINFORCE) are adjusted to account for the
+      reduced group size introduced by partial rollout.
+
+Key Features:
+    - Partial rollout with configurable fraction (partial_percent) for reduced iteration latency
+    - Token‑budget regeneration for long‑form continuation (max_token_budget)
+    - Buffered sample management (regen_buffer, noregen_buffer) for stateful rollout
+    - Seamless integration with VLLM/SGLang backends and multimodal processing
+    - Adaptive advantage estimation that respects the partial batch size
+    - Support for both packed and unpacked sample formats
+
+Parameters:
+    partial_percent (float): Fraction of the total rollout batch to generate in one call.
+        Values between 0.0 and 1.0. Default: 0.7.
+    max_token_budget (int): Maximum allowed generation length before a sample is flagged for
+        regeneration. Samples that reach this length are stored in the regeneration buffer
+        and can be continued in a later step. Default: 1024.
+
+References:
+    - Kimi1.5: "Kimi k1.5: Scaling Reinforcement Learning with LLMs" (https://arxiv.org/abs/2501.12599)
+    - MiMo: "MiMo: Unlocking the Reasoning Potential of Language Model 
+      -- From Pretraining to Posttraining" (https://arxiv.org/abs/2505.07608)
+
+Classes:
+    PartialFastExperienceMaker: Main experience generation class with partial‑rollout support.
 """
 
 from typing import List, Optional, Union, Tuple, Dict, Any
@@ -30,12 +66,31 @@ class PartialFastExperienceMaker(FastExperienceMaker):
     """
     FastExperienceMaker with partial rollout and token‑budget regeneration.
 
+    This class extends FastExperienceMaker to support incremental rollout and controlled generation
+    for long‑form or high‑cost tasks. It introduces two core mechanisms:
+        1. Partial rollout: only a fraction (partial_percent) of the total rollout batch is generated
+           in each call; the remaining samples are kept in buffers for subsequent steps, reducing
+           per‑iteration latency and enabling smoother pipeline scheduling.
+        2. Token‑budget regeneration: samples that reach a predefined token budget (max_token_budget)
+           are flagged and can be regenerated later, allowing continuation of long‑form generation
+           without discarding already‑produced content.
+
+    The class reuses the parent's infrastructure (MultimodalDataProcessor, RewardComputationEngine,
+    etc.) and only overrides the methods that implement the partial‑rollout logic.
+
+    The partial‑rollout pipeline:
+        1. Buffer Management: Maintain regeneration (regen) and non‑regeneration (noregen) buffers
+        2. Need‑Prompts Check: Determine if fresh prompts are required to fill the partial batch
+        3. Generation: Use parent's inference engine (VLLM/SGLang) but respect token budget and partial fraction
+        4. Regeneration: For samples that exceed token budget, regenerate with continuation
+        5. Advantage Adaptation: Adjust advantage estimators (RLOO, Group Norm, REINFORCE) for partial group size
+
     Args:
-        partial_percent (float): fraction of the rollout batch to generate in one call.
-        max_token_budget (int): maximum allowed generation length before regeneration.
-        packing_samples (bool): whether to pack samples (inherited).
-        processor: multimodal processor (inherited).
-        *args, **kwargs: passed to parent.
+        partial_percent: Fraction of the total rollout batch to generate in one call (0.0‑1.0)
+        max_token_budget: Maximum allowed generation length before a sample is flagged for regeneration
+        packing_samples: Whether to pack multiple sequences into single batch (inherited from parent)
+        processor: Multimodal processor for vision‑language models (inherited from parent)
+        *args, **kwargs: Arguments passed to parent FastExperienceMaker
     """
 
     def __init__(
@@ -47,6 +102,22 @@ class PartialFastExperienceMaker(FastExperienceMaker):
         processor=None,
         **kwargs
     ):
+        """
+        Initialize PartialFastExperienceMaker.
+
+        :param args: Positional arguments for parent FastExperienceMaker
+        :type args: tuple
+        :param partial_percent: Fraction of total rollout batch to generate per call (0.0‑1.0)
+        :type partial_percent: float
+        :param max_token_budget: Maximum generation length before a sample is flagged for regeneration
+        :type max_token_budget: int
+        :param packing_samples: Enable sample packing for efficiency (inherited)
+        :type packing_samples: bool
+        :param processor: Multimodal processor for vision‑language models (inherited)
+        :type processor: Optional[Any]
+        :param kwargs: Keyword arguments for parent FastExperienceMaker
+        :type kwargs: dict
+        """
         super().__init__(*args, packing_samples=packing_samples, processor=processor, **kwargs)
         self.partial_percent = partial_percent
         self.max_token_budget = max_token_budget
@@ -57,7 +128,8 @@ class PartialFastExperienceMaker(FastExperienceMaker):
         self.noregen_buffer: Dict[str, List] = {}
         fields = [
             'output', 'labels', 'prompts', 'images', 'images_num',
-            'images_pixel_values', 'images_grid_thw', 'image_flags', 'references'
+            'images_pixel_values', 'images_grid_thw', 'image_flags', 'references',
+            'videos', 'videos_num', 'videos_pixel_values', 'videos_grid_thw', 'video_flags'
         ]
         for field in fields:
             self.regen_buffer[field] = []
@@ -69,10 +141,21 @@ class PartialFastExperienceMaker(FastExperienceMaker):
 
     def need_new_prompts(self, rollout_batch_size: int, micro_rollout_batch_size: int) -> bool:
         """
-        Check whether the buffers contain enough data to make a full experience batch.
+        Determine whether new prompts are required to fill the partial rollout batch.
 
-        Returns:
-            True if new prompts need to be fetched (i.e., buffers are below the partial threshold).
+        This method checks the current regeneration and non‑regeneration buffers
+        and compares the total stored samples against the number needed for the
+        current partial rollout (partial_percent × total rollout batch size).
+
+        If the buffers contain insufficient samples, the caller should fetch fresh
+        prompts and call generate_samples with those prompts.
+
+        :param rollout_batch_size: Total number of samples in a full rollout batch
+        :type rollout_batch_size: int
+        :param micro_rollout_batch_size: Size of each micro‑batch used in generation
+        :type micro_rollout_batch_size: int
+        :return: True if new prompts are needed (buffers below partial threshold), else False
+        :rtype: bool
         """
         self.rollout_batch_size = rollout_batch_size
         self.micro_rollout_batch_size = micro_rollout_batch_size
@@ -92,7 +175,9 @@ class PartialFastExperienceMaker(FastExperienceMaker):
         self,
         all_prompts: List[str],
         all_images: Optional[List] = None,
+        all_videos: Optional[List] = None,
         images_num: Optional[List[int]] = None,
+        videos_num: Optional[List[int]] = None,
         all_references: Optional[List[str]] = None,
         all_labels: Optional[List] = None,
         **generate_kwargs
@@ -100,18 +185,41 @@ class PartialFastExperienceMaker(FastExperienceMaker):
         """
         Generate samples using the parent's pipeline, but only a partial fraction.
 
-        The method:
-          1. If new inputs are provided, generate them with the parent's generate_samples.
-          2. Split the generated outputs into regeneration and non‑regeneration buffers.
-          3. Draw from the buffers to produce the requested number of samples (partial_percent).
-          4. If the noregen buffer is insufficient, regenerate some samples from the regen buffer.
+        This method implements the partial‑rollout logic:
+          1. If new prompts are provided, generate them via the parent's inference engine
+             (VLLM/SGLang) using token‑budget‑limited generation.
+          2. Split the generated outputs into regeneration (regen) and non‑regeneration (noregen)
+             buffers based on whether they have reached the token budget.
+          3. Draw from the buffers to produce the requested number of samples
+             (partial_percent × total rollout batch size).
+          4. If the noregen buffer is insufficient, regenerate some samples from the regen buffer
+             by continuing generation from the partially‑produced output.
 
-        Returns:
-            List of Samples (or SamplesVL) ready for experience making.
+        The method returns a list of Samples (or SamplesVL) ready for experience making.
+        When new prompts are provided, it also returns the image counts for multimodal data.
+
+        :param all_prompts: List of text prompts (or None to only draw from buffers)
+        :type all_prompts: List[str]
+        :param all_images: Optional images for vision‑language models
+        :type all_images: Optional[List]
+        :param all_videos: Optional videos for vision‑language models
+        :type all_videos: Optional[List]
+        :param images_num: Number of images per prompt
+        :type images_num: Optional[List[int]]
+        :param videos_num: Number of videos per prompt
+        :type videos_num: Optional[List[int]]
+        :param all_references: Reference texts for evaluation
+        :type all_references: Optional[List[str]]
+        :param all_labels: Sample labels for reward shaping
+        :type all_labels: Optional[List]
+        :param generate_kwargs: Generation parameters (temperature, max_new_tokens, etc.)
+        :type generate_kwargs: dict
+        :return: List of Samples (or SamplesVL) when all_prompts is None,
+                 otherwise tuple (samples_list, images_num_list)
+        :rtype: Union[List[Samples], Tuple[List[Samples], Optional[List[int]]]]
         """
         args = self.strategy.args
-        is_multimodal = all_images is not None
-        internvl = "internvl" in self.actor.pretrain_or_model.lower() if is_multimodal else False
+        is_multimodal = all_images is not None or all_videos is not None
 
         # --------------------------------------------------------------------
         # Step 1: Generate new samples if inputs are provided
@@ -155,9 +263,10 @@ class PartialFastExperienceMaker(FastExperienceMaker):
                 processed = self._process_multimodal_data(
                     all_prompts=all_prompts,
                     all_images=all_images,
-                    is_internvl=internvl,
+                    all_videos=all_videos,
                     all_references=all_references,
-                    images_num=images_num
+                    images_num=images_num,
+                    videos_num=videos_num
                 )
                 prompt_token_ids = processed["all_prompt_token_ids"]
                 prompts = processed["all_prompts"]
@@ -167,6 +276,11 @@ class PartialFastExperienceMaker(FastExperienceMaker):
                 grid_thw = processed["all_images_grid_thw"]
                 image_flags = processed["all_image_flags"]
                 references = processed["all_references"]
+                videos = processed.get("all_videos")
+                videos_num = processed.get("all_videos_num")
+                pixel_values_videos = processed.get("all_videos_pixel_values")
+                video_grid_thw = processed.get("all_videos_grid_thw")
+                video_flags = processed.get("all_video_flags")
             else:
                 tokenized = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)
                 prompt_token_ids = tokenized["input_ids"]
@@ -244,7 +358,6 @@ class PartialFastExperienceMaker(FastExperienceMaker):
         samples_list = self._generate_sample_list(
             samples_data,
             is_multimodal,
-            internvl,
             **generate_kwargs
         )
         self.strategy.maybe_sleep_inference_engine()
@@ -255,15 +368,17 @@ class PartialFastExperienceMaker(FastExperienceMaker):
             images_num_list = samples_data.get("images_num")
             return samples_list, images_num_list
 
-    def _process_multimodal_data(self, all_prompts, all_images, is_internvl, all_references, images_num):
+    def _process_multimodal_data(self, all_prompts, all_images, all_videos, is_internvl, all_references, images_num, videos_num):
         """Wrapper around parent's multimodal_processor.process_multimodal_batch."""
         if self.multimodal_processor is None:
             raise ValueError("Multimodal processor not initialized.")
         return self.multimodal_processor.process_multimodal_batch(
             all_prompts=all_prompts,
             all_images=all_images,
+            all_videos=all_videos,
             all_references=all_references,
             images_num=images_num,
+            videos_num=videos_num,
             n_samples_per_prompt=self.strategy.config.n_samples_per_prompt,
             is_internvl=is_internvl,
         )
@@ -411,7 +526,6 @@ class PartialFastExperienceMaker(FastExperienceMaker):
         self,
         samples_data: Dict[str, List],
         is_multimodal: bool,
-        internvl: bool,
         **kwargs
     ) -> List[Samples]:
         """Convert buffered data into a list of Samples."""
@@ -468,14 +582,8 @@ class PartialFastExperienceMaker(FastExperienceMaker):
                         image_num = all_images_num[i + j]
                         for image_id in range(0, image_num):
                             images_grid = images_grid_thw[images_grid_id + image_id]
-                            if internvl:
-                                num_patch = images_grid if isinstance(images_grid, int) else images_grid.sum().item()
-                                _image_flags = all_image_flags[index_pixel_patch: index_pixel_patch + num_patch]
-                                image_flags.append(_image_flags)
-                                image_grid_thw_list.append(torch.tensor([1, 1, num_patch]).unsqueeze(0))
-                            else:
-                                num_patch = images_grid[0] * images_grid[1] * images_grid[2]
-                                image_grid_thw_list.append(images_grid.clone().unsqueeze(0))
+                            num_patch = images_grid[0] * images_grid[1] * images_grid[2]
+                            image_grid_thw_list.append(images_grid.clone().unsqueeze(0))
                             images_pixel_value = all_images_pixel_values[index_pixel_patch: index_pixel_patch + num_patch]
                             pixel_values.append(images_pixel_value.clone())
                             index_pixel_patch += num_patch
@@ -505,22 +613,18 @@ class PartialFastExperienceMaker(FastExperienceMaker):
                         )
                     )
                 else:
-                    if internvl:
-                        pixel_values_intern = torch.cat(pixel_values, dim=0).to("cuda") if pixel_values else None
-                        pixel_values = None
-                    else:
-                        pixel_values = torch.cat(pixel_values, dim=0).to("cuda") if pixel_values else None
-                        pixel_values_intern = None
+                    pixel_values = torch.cat(pixel_values, dim=0).to("cuda") if pixel_values else None
+                    pixel_values_intern = None
                     samples_list.append(
                         SamplesVL(
                             sequences=sequences,
                             attention_mask=attention_mask,
                             action_mask=action_mask,
-                            image_grid_thws=torch.cat(image_grid_thw_list, dim=0).to("cuda") if not internvl else None,
+                            image_grid_thws=torch.cat(image_grid_thw_list, dim=0).to("cuda"),
                             raw_images=raw_images,
                             pixel_values=pixel_values,
                             pixel_values_intern=pixel_values_intern,
-                            image_flags=torch.cat(image_flags, dim=0).to("cuda") if internvl else None,
+                            image_flags=torch.cat(image_flags, dim=0).to("cuda"),
                             num_actions=action_mask.size(1),
                             packed_seq_lens=None,
                             response_length=action_mask.float().sum(dim=-1),
@@ -574,10 +678,22 @@ class PartialFastExperienceMaker(FastExperienceMaker):
 
     def process_experiences(self, experiences: List[Experience]) -> Tuple[List[Experience], List[torch.Tensor]]:
         """
-        Process experiences (reward shaping for partial rollout).
+        Process experiences for reward shaping and filtering under partial rollout.
 
-        This method overrides the parent's _process_experiences to handle
-        advantage estimators that expect a different group size (partial_percent).
+        This method overrides the parent's process_experiences to adjust advantage
+        estimators (RLOO, Group Norm, REINFORCE) for the reduced group size introduced
+        by partial rollout. The group size is scaled by partial_percent to reflect the
+        actual number of samples generated per call.
+
+        For each estimator:
+          - RLOO: Uses n_samples_per_prompt as usual (since RLOO operates per‑prompt)
+          - GRPO/Group Norm: Adjusts group size to partial_percent × rollout_batch_size // micro_rollout_batch_size
+          - REINFORCE Baseline: Removes the baseline using the same n_samples_per_prompt
+
+        :param experiences: List of Experience objects with raw rewards stored in info["reward"]
+        :type experiences: List[Experience]
+        :return: Tuple of (unchanged experiences, shaped reward tensors split per experience)
+        :rtype: Tuple[List[Experience], List[torch.Tensor]]
         """
         args = self.strategy.args
         if args.advantage_estimator == "rloo":

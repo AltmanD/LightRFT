@@ -690,7 +690,7 @@ class SPMDPPOTrainerVL(SPMDPPOTrainerBase, PPOTrainerVL):
         # Then initialize our base class
         assert "processor" in kwargs and kwargs["processor"] is not None, "processor is required for SPMDPPOTrainerVL"
         SPMDPPOTrainerBase.__init__(self, *args, VLM=True, **kwargs)
-        if getattr(self.args, 'use_partial', False):
+        if self.args.use_partial:
             # Replace experience maker with partial version
             self.experience_maker = PartialFastExperienceMaker(
                 self.actor,
@@ -715,12 +715,17 @@ class SPMDPPOTrainerVL(SPMDPPOTrainerBase, PPOTrainerVL):
         """
         Create an iterator that yields batches of experiences.
 
-        Args:
-            dataloader: The dataloader providing prompts, images, references, and labels.
-            use_partial: Whether to use partial rollout logic.
+        This method handles both partial and non‑partial rollout logic.
+        For partial rollouts, it reuses cached prompts when possible to reduce
+        data loading overhead. For standard rollouts, it processes each batch
+        from the dataloader sequentially.
 
-        Yields:
-            List[Experience]: A list of experiences for each training step.
+        :param dataloader: DataLoader providing prompts, images, references, and labels
+        :type dataloader: torch.utils.data.DataLoader
+        :param use_partial: Whether to use partial rollout logic
+        :type use_partial: bool
+        :yield: List of Experience objects for each training step
+        :ytype: List[lightrft.trainer.experience_maker_vl.Experience]
         """
         if use_partial:
             # Partial rollout logic
@@ -757,12 +762,20 @@ class SPMDPPOTrainerVL(SPMDPPOTrainerBase, PPOTrainerVL):
         """
         Process a batch of experiences: add to replay buffer, train, and update metrics.
 
-        Args:
-            experiences: List of Experience objects.
-            steps: Current step counter.
+        This method handles the core training loop for each batch of experiences:
+        1. Appends experiences to the replay buffer
+        2. Reports memory usage
+        3. Normalizes advantages (if not using group normalization)
+        4. Executes PPO training
+        5. Clears the replay buffer
+        6. Updates KL control coefficient
 
-        Returns:
-            dict: Training status metrics.
+        :param experiences: List of Experience objects to process
+        :type experiences: List[lightrft.trainer.experience_maker_vl.Experience]
+        :param steps: Current step counter for training progress tracking
+        :type steps: int
+        :return: Dictionary containing training status metrics (policy loss, critic loss, reward, etc.)
+        :rtype: Dict[str, float]
         """
         # Add experiences to replay buffer
         for i, experience in enumerate(experiences):
