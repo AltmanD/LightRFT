@@ -53,13 +53,13 @@ import time
 from copy import deepcopy
 
 import torch
-import torch.distributed as dist
 from vllm import SamplingParams
 from easydict import EasyDict
 
-from openrlhf.trainer.ppo_utils.experience_maker import Experience, Samples
-from openrlhf.trainer.ppo_utils.experience_maker_vl import SamplesVL
+from lightrft.trainer.experience_maker import Experience, Samples
+from lightrft.trainer.experience_maker_vl import SamplesVL
 from lightrft.trainer.fast_exp_maker import FastExperienceMaker
+from lightrft.utils import Timer, get_current_device
 
 
 class PartialFastExperienceMaker(FastExperienceMaker):
@@ -127,9 +127,9 @@ class PartialFastExperienceMaker(FastExperienceMaker):
         self.regen_buffer: Dict[str, List] = {}
         self.noregen_buffer: Dict[str, List] = {}
         fields = [
-            'output', 'labels', 'prompts', 'images', 'images_num',
-            'images_pixel_values', 'images_grid_thw', 'image_flags', 'references',
-            'videos', 'videos_num', 'videos_pixel_values', 'videos_grid_thw', 'video_flags'
+            'output', 'labels', 'prompts', 'references',
+            'images', 'images_num', 'images_grid_thw', 'images_pixel_values',
+            'videos', 'videos_num', 'videos_grid_thw', 'videos_pixel_values'
         ]
         for field in fields:
             self.regen_buffer[field] = []
@@ -161,7 +161,7 @@ class PartialFastExperienceMaker(FastExperienceMaker):
         self.micro_rollout_batch_size = micro_rollout_batch_size
 
         # Total micro‑batches needed for a full rollout
-        total_micro = rollout_batch_size // micro_rollout_batch_size
+        total_micro = rollout_batch_size // self.strategy.world_size
         # Micro‑batches we want to generate in one call
         target_micro = int(self.partial_percent * total_micro)
         required_samples = target_micro * micro_rollout_batch_size
@@ -218,8 +218,18 @@ class PartialFastExperienceMaker(FastExperienceMaker):
                  otherwise tuple (samples_list, images_num_list)
         :rtype: Union[List[Samples], Tuple[List[Samples], Optional[List[int]]]]
         """
-        args = self.strategy.args
-        is_multimodal = all_images is not None or all_videos is not None
+        assert self.strategy.inference_engine is not None, "Inference engine required"
+
+        torch.cuda.synchronize()
+        start_time = time.time()
+
+        config = self.strategy.config
+        if all_prompts is not None:
+            is_multimodal = all_images is not None or all_videos is not None
+        else:
+            is_multimodal = (len(self.noregen_buffer.get('images', [])) + len(self.regen_buffer.get('images', []))) != 0 or \
+            (len(self.noregen_buffer.get('videos', [])) + len(self.regen_buffer.get('videos', []))) != 0
+        n_samples = config.n_samples_per_prompt
 
         # --------------------------------------------------------------------
         # Step 1: Generate new samples if inputs are provided
@@ -227,7 +237,7 @@ class PartialFastExperienceMaker(FastExperienceMaker):
         if all_prompts is not None:
             # Replicate the generation logic from fast_exp_maker_partial.py
             # Prepare sampling parameters
-            if args.engine_type == "vllm":
+            if config.engine_type == "vllm":
                 sampling_params = SamplingParams(
                     temperature=generate_kwargs.get("temperature", 1.0),
                     top_p=generate_kwargs.get("top_p", 1.0),
@@ -238,7 +248,7 @@ class PartialFastExperienceMaker(FastExperienceMaker):
                     include_stop_str_in_output=True,
                     ignore_eos=os.environ.get("IGNORE_EOS", "0") == "1",
                 )
-            elif args.engine_type == "sglang":
+            elif config.engine_type == "sglang":
                 sampling_params = dict(
                     n=1,
                     temperature=generate_kwargs.get("temperature", 1.0),
@@ -253,60 +263,93 @@ class PartialFastExperienceMaker(FastExperienceMaker):
                     ignore_eos=os.environ.get("IGNORE_EOS", "0") == "1",
                 )
             else:
-                raise ValueError(f"Unsupported backend: {args.engine_type}")
+                raise ValueError(f"Unsupported backend: {config.engine_type}")
 
             # Expand labels
-            expanded_labels = sum([[label] * args.n_samples_per_prompt for label in all_labels], []) if all_labels else []
+            expanded_labels = sum([[label] * n_samples for label in all_labels], []) if all_labels else []
 
             # Process multimodal data
             if is_multimodal:
-                processed = self._process_multimodal_data(
+                processed = self.multimodal_processor.process_multimodal_batch(
                     all_prompts=all_prompts,
                     all_images=all_images,
                     all_videos=all_videos,
                     all_references=all_references,
                     images_num=images_num,
-                    videos_num=videos_num
+                    videos_num=videos_num,
+                    n_samples_per_prompt=n_samples,
                 )
                 prompt_token_ids = processed["all_prompt_token_ids"]
                 prompts = processed["all_prompts"]
                 images = processed["all_images"]
                 images_num = processed["all_images_num"]
-                pixel_values = processed["all_images_pixel_values"]
-                grid_thw = processed["all_images_grid_thw"]
-                image_flags = processed["all_image_flags"]
+                images_pixel_values = processed["all_images_pixel_values"]
+                images_grid_thw = processed["all_images_grid_thw"]
                 references = processed["all_references"]
                 videos = processed.get("all_videos")
                 videos_num = processed.get("all_videos_num")
-                pixel_values_videos = processed.get("all_videos_pixel_values")
-                video_grid_thw = processed.get("all_videos_grid_thw")
-                video_flags = processed.get("all_video_flags")
+                videos_pixel_values = processed.get("all_videos_pixel_values")
+                videos_grid_thw = processed.get("all_videos_grid_thw")
             else:
+                # Text-only processing
                 tokenized = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)
-                prompt_token_ids = tokenized["input_ids"]
-                prompt_token_ids = sum([[token_ids] * args.n_samples_per_prompt for token_ids in prompt_token_ids], [])
-                prompts = all_prompts * args.n_samples_per_prompt
-                images = None
-                references = all_references * args.n_samples_per_prompt if all_references else None
+                prompt_token_ids = sum([[token_ids] * n_samples for token_ids in tokenized["input_ids"]], [])
 
-            # Generate outputs via inference engine
-            outputs = self.strategy.gather_and_generate(
-                sampling_params=sampling_params,
-                all_prompt_token_ids=prompt_token_ids,
-                all_prompts=prompts if is_multimodal else None,
-                all_images=images if is_multimodal else None,
-                sleep_engine=False,
-                images_num=images_num if is_multimodal else None,
-            )
+            # ========== Generate via Inference Engine ==========
+            # Call fire_sampling function or direct generation
+            try:
+                if hasattr(self.strategy.args, 'use_fire') and self.strategy.args.use_fire:
+                    # Use FIRE sampling (Flaming-hot Initiation with Regular Execution)
+                    outputs = fire_sampling(
+                        all_prompt_token_ids=all_prompt_token_ids,
+                        generate_fn=generate_fn,  # noqa: TODO
+                        engine_type=config.engine_type,
+                        first_token_temperature=generate_kwargs.get("first_token_temperature", 10.0),
+                        temperature=generate_kwargs.get("temperature", 1.0),
+                        first_token_top_k=generate_kwargs.get(
+                            "first_token_top_k", sampling_params.top_k if hasattr(sampling_params, 'top_k') else -1
+                        ),
+                        first_token_top_p=generate_kwargs.get(
+                            "first_token_top_p", sampling_params.top_p if hasattr(sampling_params, 'top_p') else 1.0
+                        ),
+                        is_multimodal=is_multimodal,
+                        all_prompts=prompts,
+                        all_images=images,
+                        all_videos=videos,
+                        all_images_num=images_num,
+                        all_videos_num=videos_num,
+                        sampling_params=sampling_params,
+                    )
+                else:
+                    # maybe this can be called in if and else respectively? or like this?
+                    # Use original single-shot generation
+                    outputs = self.strategy.gather_and_generate(
+                        sampling_params=sampling_params,
+                        all_prompt_token_ids=prompt_token_ids,
+                        all_prompts=prompts if is_multimodal else None,
+                        sleep_engine=self.strategy.args.enable_engine_sleep,
+                        all_images=images if is_multimodal else None,
+                        all_videos=videos if is_multimodal else None,
+                        images_num=images_num if is_multimodal else None,
+                        videos_num=videos_num if is_multimodal else None,
+                    )
+            except ValueError as e:
+                if "prompt" in str(e) and "too long" in str(e):
+                    self.strategy.print(f"[Skip] {e}")
+                    return None  # Return None, subsequent experience_maker will ignore
+                else:
+                    raise
 
             # Process outputs in micro-batches and store in buffers
-            for i in range(0, len(outputs), args.micro_rollout_batch_size):
-                batch_slice = slice(i, i + args.micro_rollout_batch_size)
+            for i in range(0, len(outputs), n_samples):
+                batch_slice = slice(i, i + n_samples)
                 output_batch = outputs[batch_slice]
                 labels_batch = expanded_labels[batch_slice] if expanded_labels else []
                 prompts_batch = prompts[batch_slice]
                 images_batch = images[batch_slice] if images else None
                 images_num_batch = images_num[batch_slice] if images_num else None
+                videos_batch = videos[batch_slice] if videos else None
+                videos_num_batch = videos_num[batch_slice] if videos_num else None
                 references_batch = references[batch_slice] if references else None
 
                 # Check if regeneration is needed
@@ -321,23 +364,31 @@ class PartialFastExperienceMaker(FastExperienceMaker):
                     self._add_to_buffer(buffer_type, "images", images_batch)
                 if images_num_batch is not None:
                     self._add_to_buffer(buffer_type, "images_num", images_num_batch)
+                if videos_batch is not None:
+                    self._add_to_buffer(buffer_type, "videos", videos_batch)
+                if videos_num_batch is not None:
+                    self._add_to_buffer(buffer_type, "videos_num", videos_num_batch)
                 if references_batch is not None:
                     self._add_to_buffer(buffer_type, "references", references_batch)
 
                 if is_multimodal:
-                    self._add_to_buffer(buffer_type, "image_flags", image_flags[batch_slice])
                     # Handle image tensors
-                    grid_batch = grid_thw[batch_slice]
+                    grid_batch = images_grid_thw[batch_slice]
                     self._add_to_buffer(buffer_type, "images_grid_thw", grid_batch)
                     # Calculate pixel values slice
-                    patch_start = sum(g[0] * g[1] * g[2] for g in grid_thw[:i])
+                    patch_start = sum(g[0] * g[1] * g[2] for g in images_grid_thw[:i])
                     patch_end = patch_start + sum(g[0] * g[1] * g[2] for g in grid_batch)
-                    self._add_to_buffer(buffer_type, "images_pixel_values", pixel_values[patch_start:patch_end])
+                    self._add_to_buffer(buffer_type, "images_pixel_values", images_pixel_values[patch_start:patch_end])
+                    # Handle video tensors
+                    if videos_grid_thw is not None:
+                        videos_grid_batch = videos_grid_thw[batch_slice]
+                        self._add_to_buffer(buffer_type, "videos_grid_thw", videos_grid_batch)
+                    
 
         # --------------------------------------------------------------------
         # Step 2: Determine how many micro‑batches we need to return
         # --------------------------------------------------------------------
-        total_micro = self.rollout_batch_size // self.micro_rollout_batch_size
+        total_micro = self.rollout_batch_size // self.strategy.world_size
         target_micro = int(self.partial_percent * total_micro)
 
         # How many micro‑batches are already available in the noregen buffer?
@@ -349,67 +400,207 @@ class PartialFastExperienceMaker(FastExperienceMaker):
             # Take all noregen samples and supplement with regenerated ones
             samples_needed = target_micro - noregen_micro
             noregen_data = self._get_from_buffer('noregen', noregen_micro * self.micro_rollout_batch_size)
-            regen_data = self._regenerate_from_buffer(samples_needed * self.micro_rollout_batch_size, **generate_kwargs)
+            regen_data = self._regenerate_from_buffer(samples_needed * self.micro_rollout_batch_size, is_multimodal, **generate_kwargs)
             samples_data = self._merge_data(noregen_data, regen_data)
 
         # --------------------------------------------------------------------
         # Step 3: Convert the collected data back to Samples objects
         # --------------------------------------------------------------------
-        samples_list = self._generate_sample_list(
-            samples_data,
-            is_multimodal,
-            **generate_kwargs
-        )
-        self.strategy.maybe_sleep_inference_engine()
-        if all_prompts is None:
-            return samples_list
-        else:
-            # Return tuple with samples_list and images_num, consistent with fast_exp_maker_partial.py
-            images_num_list = samples_data.get("images_num")
-            return samples_list, images_num_list
+        samples_list = []
+        image_patch_idx = 0
+        video_patch_idx = 0
+        image_start_idx = 0
+        video_start_idx = 0
 
-    def _process_multimodal_data(self, all_prompts, all_images, all_videos, is_internvl, all_references, images_num, videos_num):
-        """Wrapper around parent's multimodal_processor.process_multimodal_batch."""
-        if self.multimodal_processor is None:
-            raise ValueError("Multimodal processor not initialized.")
-        return self.multimodal_processor.process_multimodal_batch(
-            all_prompts=all_prompts,
-            all_images=all_images,
-            all_videos=all_videos,
-            all_references=all_references,
-            images_num=images_num,
-            videos_num=videos_num,
-            n_samples_per_prompt=self.strategy.config.n_samples_per_prompt,
-            is_internvl=is_internvl,
-        )
+        all_outputs = samples_data.get("output", [])
+        all_labels = samples_data.get("labels", [])
+        all_prompts = samples_data.get("prompts", [])
+        all_images = samples_data.get("images", [])
+        all_images_num = samples_data.get("images_num", None)
+        all_images_grid_thw = samples_data.get("images_grid_thw", None)
+        all_images_pixel_values = samples_data.get("images_pixel_values", None)
+        all_videos_num = samples_data.get("videos_num", None)
+        all_videos_grid_thw = samples_data.get("videos_grid_thw", None)
+        all_videos_pixel_values = samples_data.get("videos_pixel_values", None)
+        all_references = samples_data.get("references", [])
+
+        for i in range(0, len(all_outputs), config.micro_rollout_batch_size):
+            micro_batch_outputs = all_outputs[i:i + config.micro_rollout_batch_size]
+            micro_batch_prompts = all_prompts[i:i + config.micro_rollout_batch_size]
+
+            # Extract micro-batch data
+            micro_batch_grid_thw = None
+            micro_batch_video_grid_thw = None
+            micro_batch_raw_images = None
+
+            if is_multimodal:
+                rollout_image_count = sum(all_images_num[i:i + config.micro_rollout_batch_size])
+                micro_batch_grid_thw = all_images_grid_thw[image_start_idx:image_start_idx + rollout_image_count]
+                micro_batch_raw_images = all_images[i:i + config.micro_rollout_batch_size]
+                image_start_idx += rollout_image_count
+
+                rollout_video_count = sum(all_videos_num[i:i + config.micro_rollout_batch_size])
+                micro_batch_video_grid_thw = all_videos_grid_thw[video_start_idx:video_start_idx + rollout_video_count]
+                video_start_idx += rollout_video_count
+
+            micro_batch_references = (all_references[i:i + config.micro_rollout_batch_size] if all_references else None)
+            micro_batch_labels = (all_labels[i:i + config.micro_rollout_batch_size] if all_labels else None)
+            # Build samples
+            if not self.packing_samples:
+                sample, updated_patch_idx, updated_video_patch_idx = self._build_unpacked_sample(
+                    outputs=micro_batch_outputs,
+                    prompts=micro_batch_prompts,
+                    labels=micro_batch_labels,
+                    references=micro_batch_references,
+                    is_multimodal=is_multimodal,
+                    grid_thw=micro_batch_grid_thw,
+                    video_grid_thw=micro_batch_video_grid_thw,
+                    raw_images=micro_batch_raw_images,
+                    pixel_values=all_images_pixel_values if is_multimodal else None,
+                    pixel_values_videos=all_videos_pixel_values if is_multimodal else None,
+                    images_num=all_images_num[i:i + config.micro_rollout_batch_size] if is_multimodal else None,
+                    videos_num=all_videos_num[i:i + config.micro_rollout_batch_size] if is_multimodal else None,
+                    image_patch_idx=image_patch_idx,
+                    video_patch_idx=video_patch_idx,
+                )
+                # Update patch indices from the returned values
+                if updated_patch_idx is not None:
+                    image_patch_idx = updated_patch_idx
+                if updated_video_patch_idx is not None:
+                    video_patch_idx = updated_video_patch_idx
+                samples_list.append(sample)
+            else:
+                # Packed samples
+                sample = self._build_packed_sample(
+                    outputs=micro_batch_outputs,
+                    prompts=micro_batch_prompts,
+                    labels=micro_batch_labels,
+                    references=micro_batch_references,
+                )
+                samples_list.append(sample)
+
+        # Report timing
+        torch.cuda.synchronize()
+        gen_time = torch.tensor(time.time() - start_time, device=get_current_device())
+        torch.distributed.all_reduce(gen_time, op=torch.distributed.ReduceOp.MAX)
+        self.strategy.print(f"***Rollout engine generation time (global max): {gen_time.item():.4f}s")
+        self.strategy.report_memory("after rollout engine generation")
+
+        return samples_list
 
     def _add_to_buffer(self, buffer_type: str, data_name: str, data):
-        """Add data to specified buffer."""
+        """Add data to specified buffer.
+        
+        Args:
+            buffer_type: 'regen' or 'noregen'
+            data_name: Key name for storing data
+            data: Data to add (can be tensor, list, or other)
+        
+        Special handling:
+        - Keys with 'grid_thw': split 2D tensors by rows
+        - Keys with 'pixel_values': keep 2D tensors as-is
+        - Other 2D tensors: split by rows
+        """
         buffer = self.regen_buffer if buffer_type == 'regen' else self.noregen_buffer
         if data_name not in buffer:
             buffer[data_name] = []
+        
         if isinstance(data, torch.Tensor):
-            buffer[data_name].append(data)
+            is_grid_thw = 'grid_thw' in data_name
+            is_pixel_values = 'pixel_values' in data_name
+            
+            if data.dim() == 2:
+                if is_grid_thw:
+                    # Split grid_thw 2D tensors by rows
+                    buffer[data_name].extend(torch.unbind(data, dim=0))
+                elif is_pixel_values:
+                    # Keep pixel_values 2D tensors intact
+                    buffer[data_name].append(data)
+                else:
+                    # Split other 2D tensors by rows
+                    buffer[data_name].extend(torch.unbind(data, dim=0))
+            else:
+                # Add 1D or higher-dim tensors as-is
+                buffer[data_name].append(data)
         else:
             buffer[data_name].extend(data if isinstance(data, list) else [data])
 
-    def _get_from_buffer(self, buffer_type: str, count: Optional[int]):
-        """Retrieve data from buffer, optionally limiting the amount."""
+
+    def _get_from_buffer(self, buffer_type: str, count: Optional[int] = None):
+        """Retrieve data from buffer, optionally limiting the amount.
+        
+        Args:
+            buffer_type: 'regen' or 'noregen'
+            count: Number of items to retrieve. If None, retrieve all.
+        
+        Returns:
+            Dictionary with retrieved data.
+            Special handling:
+            - grid_thw keys: stack 1D tensors to 2D
+            - pixel_values keys: concatenate 2D tensors
+        """
         buffer = self.regen_buffer if buffer_type == 'regen' else self.noregen_buffer
         result = {}
+        
         for key, lst in buffer.items():
+            if not lst:
+                # Return empty tensor with proper shape
+                if 'grid_thw' in key:
+                    result[key] = torch.tensor([]).reshape(0, 3)
+                elif 'pixel_values' in key:
+                    result[key] = torch.tensor([])
+                else:
+                    result[key] = torch.tensor([])
+                
+                if count is None:
+                    buffer[key] = []
+                continue
+            
+            all_tensors = all(isinstance(item, torch.Tensor) for item in lst)
+            
             if count is None:
-                result[key] = lst.copy()
+                # Retrieve all data
+                if all_tensors:
+                    if 'pixel_values' in key and lst[0].dim() >= 2:
+                        # Concatenate pixel_values 2D tensors
+                        result[key] = torch.cat(lst, dim=0) if lst else torch.tensor([])
+                    elif 'grid_thw' in key and lst[0].dim() == 1:
+                        # Stack grid_thw 1D tensors to 2D
+                        result[key] = torch.stack(lst, dim=0) if lst else torch.tensor([]).reshape(0, 3)
+                    elif lst[0].dim() == 1:
+                        # Stack 1D tensors to 2D
+                        result[key] = torch.stack(lst, dim=0) if lst else torch.tensor([])
+                    else:
+                        # Concatenate other tensors
+                        result[key] = torch.cat(lst, dim=0) if lst else torch.tensor([])
+                else:
+                    result[key] = lst.copy()
                 buffer[key] = []
             else:
-                result[key] = lst[:count]
+                # Retrieve specified number of items
+                items_to_take = lst[:count]
+                
+                if all_tensors and items_to_take:
+                    if 'pixel_values' in key and items_to_take[0].dim() >= 2:
+                        result[key] = torch.cat(items_to_take, dim=0)
+                    elif 'grid_thw' in key and items_to_take[0].dim() == 1:
+                        result[key] = torch.stack(items_to_take, dim=0)
+                    elif items_to_take[0].dim() == 1:
+                        result[key] = torch.stack(items_to_take, dim=0)
+                    else:
+                        result[key] = torch.cat(items_to_take, dim=0)
+                else:
+                    result[key] = items_to_take
+                
+                # Update buffer
                 buffer[key] = lst[count:]
+        
         return result
 
     @torch.no_grad()
-    def _regenerate_from_buffer(self, num_needed: int, **kwargs) -> dict:
+    def _regenerate_from_buffer(self, num_needed: int, is_multimodal: bool, **kwargs) -> dict:
         """Regenerate outputs for samples that reached token budget."""
-        args = self.strategy.args
+        config = self.strategy.config
 
         # Get data from regeneration buffer
         regen_data = self._get_from_buffer("regen", num_needed)
@@ -440,7 +631,7 @@ class PartialFastExperienceMaker(FastExperienceMaker):
         ]
 
         # Prepare sampling parameters
-        if args.engine_type == "vllm":
+        if config.engine_type == "vllm":
             sampling_params = SamplingParams(
                 temperature=kwargs.get("temperature", 1.0),
                 top_p=kwargs.get("top_p", 1.0),
@@ -451,7 +642,7 @@ class PartialFastExperienceMaker(FastExperienceMaker):
                 include_stop_str_in_output=True,
                 ignore_eos=os.environ.get("IGNORE_EOS", "0") == "1",
             )
-        elif args.engine_type == "sglang":
+        elif config.engine_type == "sglang":
             sampling_params = dict(
                 n=1,
                 temperature=kwargs.get("temperature", 1.0),
@@ -466,11 +657,9 @@ class PartialFastExperienceMaker(FastExperienceMaker):
                 ignore_eos=os.environ.get("IGNORE_EOS", "0") == "1",
             )
         else:
-            raise ValueError(f"Unsupported backend: {args.engine_type}")
+            raise ValueError(f"Unsupported backend: {config.engine_type}")
 
-        # Build inputs and regenerate using the same pattern as fast_exp_maker_partial.py
-        # First, check if multimodal
-        is_multimodal = regen_data.get("images") is not None and len(regen_data["images"]) > 0
+        # Build inputs and regenerate using the same pattern
         if is_multimodal:
             # Use strategy._build_multimodal_inputs
             inputs = self.strategy._build_multimodal_inputs(
@@ -521,202 +710,3 @@ class PartialFastExperienceMaker(FastExperienceMaker):
             else:
                 merged[key] = val1 if val1 else val2
         return merged
-
-    def _generate_sample_list(
-        self,
-        samples_data: Dict[str, List],
-        is_multimodal: bool,
-        **kwargs
-    ) -> List[Samples]:
-        """Convert buffered data into a list of Samples."""
-        args = self.strategy.args
-        samples_list = []
-        gen_max_len, gen_min_len = 0, 102400000
-        index_pixel_patch = 0
-        image_start_idx = 0
-
-        all_outputs = samples_data.get("output", [])
-        all_labels = samples_data.get("labels", [])
-        all_prompts = samples_data.get("prompts", [])
-        all_images = samples_data.get("images", [])
-        all_images_num = samples_data.get("images_num", [])
-        all_images_pixel_values = samples_data.get("images_pixel_values", [])
-        all_images_grid_thw = samples_data.get("images_grid_thw", [])
-        all_image_flags = samples_data.get("image_flags", [])
-        all_references = samples_data.get("references", [])
-
-        for i in range(0, len(all_outputs), args.micro_rollout_batch_size):
-            outputs = all_outputs[i: i + args.micro_rollout_batch_size]
-            prompts = all_prompts[i: i + args.micro_rollout_batch_size]
-            if all_images:
-                assert all_images_num is not None
-                rollout_image_num = sum(all_images_num[i: i + args.micro_rollout_batch_size])
-                images_grid_thw = all_images_grid_thw[image_start_idx: image_start_idx + rollout_image_num]
-                raw_images = all_images[image_start_idx: image_start_idx + rollout_image_num]
-                image_start_idx += rollout_image_num
-            if all_references:
-                references = all_references[i: i + args.micro_rollout_batch_size]
-            labels = all_labels[i: i + args.micro_rollout_batch_size]
-
-            if not self.packing_samples:
-                # Build unpacked samples
-                max_input_len, max_output_len = 0, 0
-                for output in outputs:
-                    max_input_len = max(max_input_len, len(output.prompt_token_ids))
-                    max_output_len = max(max_output_len, len(output.output_token_ids))
-
-                pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
-                sequences = []
-                pixel_values = []
-                image_grid_thw_list = []
-                image_flags = []
-                images_grid_id = 0
-                for j in range(len(outputs)):
-                    output = outputs[j]
-                    input_len = len(output.prompt_token_ids)
-                    input_ids = [pad_token_id] * (max_input_len - input_len) + list(output.prompt_token_ids)
-                    output_len = len(output.output_token_ids)
-                    output_ids = list(output.output_token_ids) + [pad_token_id] * (max_output_len - output_len)
-                    # split pixel_patch
-                    if all_images:
-                        image_num = all_images_num[i + j]
-                        for image_id in range(0, image_num):
-                            images_grid = images_grid_thw[images_grid_id + image_id]
-                            num_patch = images_grid[0] * images_grid[1] * images_grid[2]
-                            image_grid_thw_list.append(images_grid.clone().unsqueeze(0))
-                            images_pixel_value = all_images_pixel_values[index_pixel_patch: index_pixel_patch + num_patch]
-                            pixel_values.append(images_pixel_value.clone())
-                            index_pixel_patch += num_patch
-                        images_grid_id += image_num
-                    sequences.append(input_ids + output_ids)
-
-                sequences = torch.tensor(sequences)
-                sequences, attention_mask, action_mask = self.actor.process_sequences(
-                    sequences, max_input_len, eos_token_id, pad_token_id
-                )
-                sequences = sequences.to("cuda")
-                attention_mask = attention_mask.to("cuda")
-                action_mask = action_mask.to("cuda")
-                if not all_images:
-                    samples_list.append(
-                        Samples(
-                            sequences=sequences,
-                            attention_mask=attention_mask,
-                            action_mask=action_mask,
-                            num_actions=action_mask.size(1),
-                            packed_seq_lens=None,
-                            response_length=action_mask.float().sum(dim=-1),
-                            total_length=attention_mask.float().sum(dim=-1),
-                            prompts=prompts,
-                            labels=labels,
-                            pad_len=None,
-                        )
-                    )
-                else:
-                    pixel_values = torch.cat(pixel_values, dim=0).to("cuda") if pixel_values else None
-                    pixel_values_intern = None
-                    samples_list.append(
-                        SamplesVL(
-                            sequences=sequences,
-                            attention_mask=attention_mask,
-                            action_mask=action_mask,
-                            image_grid_thws=torch.cat(image_grid_thw_list, dim=0).to("cuda"),
-                            raw_images=raw_images,
-                            pixel_values=pixel_values,
-                            pixel_values_intern=pixel_values_intern,
-                            image_flags=torch.cat(image_flags, dim=0).to("cuda"),
-                            num_actions=action_mask.size(1),
-                            packed_seq_lens=None,
-                            response_length=action_mask.float().sum(dim=-1),
-                            total_length=attention_mask.float().sum(dim=-1),
-                            references=references,
-                            labels=labels,
-                            prompts=prompts,
-                        )
-                    )
-            else:
-                # Packed samples (not supporting VLM yet)
-                pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
-                sequences = []
-                packed_seq_lens = []
-                attention_mask = []
-                num_actions = []
-                for idx, output in enumerate(outputs):
-                    input_len = len(output.prompt_token_ids)
-                    output_len = len(output.output_token_ids)
-                    packed_seq_lens.append(input_len + output_len)
-                    sequences.extend(output.prompt_token_ids + list(output.output_token_ids))
-                    attention_mask.extend([idx + 1] * (input_len + output_len))
-                    num_actions.append(max(1, output_len))
-                    gen_max_len = max(gen_max_len, output_len)
-                    gen_min_len = min(gen_min_len, output_len)
-
-                sequences = torch.tensor(sequences, device="cuda").unsqueeze(0)
-                attention_mask = torch.tensor(attention_mask, device="cuda").unsqueeze(0)
-                action_mask = None
-                response_length = torch.tensor(num_actions, device="cuda", dtype=torch.float)
-                total_length = torch.tensor(packed_seq_lens, device="cuda", dtype=torch.float)
-                samples_list.append(
-                    Samples(
-                        sequences=sequences,
-                        attention_mask=attention_mask,
-                        action_mask=None,
-                        num_actions=num_actions,
-                        packed_seq_lens=packed_seq_lens,
-                        response_length=response_length,
-                        total_length=total_length,
-                        prompts=prompts,
-                        labels=labels,
-                        pad_len=None,
-                    )
-                )
-
-        if dist.get_rank(self.backend_mp_group) == 0:
-            print(f"*** response_length {gen_max_len=}, {gen_min_len=}")
-
-        return samples_list
-
-    def process_experiences(self, experiences: List[Experience]) -> Tuple[List[Experience], List[torch.Tensor]]:
-        """
-        Process experiences for reward shaping and filtering under partial rollout.
-
-        This method overrides the parent's process_experiences to adjust advantage
-        estimators (RLOO, Group Norm, REINFORCE) for the reduced group size introduced
-        by partial rollout. The group size is scaled by partial_percent to reflect the
-        actual number of samples generated per call.
-
-        For each estimator:
-          - RLOO: Uses n_samples_per_prompt as usual (since RLOO operates per‑prompt)
-          - GRPO/Group Norm: Adjusts group size to partial_percent × rollout_batch_size // micro_rollout_batch_size
-          - REINFORCE Baseline: Removes the baseline using the same n_samples_per_prompt
-
-        :param experiences: List of Experience objects with raw rewards stored in info["reward"]
-        :type experiences: List[Experience]
-        :return: Tuple of (unchanged experiences, shaped reward tensors split per experience)
-        :rtype: Tuple[List[Experience], List[torch.Tensor]]
-        """
-        args = self.strategy.args
-        if args.advantage_estimator == "rloo":
-            rewards = torch.cat([exp.info["reward"] for exp in experiences])
-            rewards = rewards.reshape(-1, args.n_samples_per_prompt)
-            baseline = (rewards.sum(-1, keepdim=True) - rewards) / (args.n_samples_per_prompt - 1)
-            rewards = rewards - baseline
-            rewards = rewards.flatten().chunk(len(experiences))
-            return experiences, rewards
-        elif args.advantage_estimator in ["grpo", "group_norm"]:
-            # Adjust group size according to partial rollout
-            group_size = int(self.partial_percent * self.rollout_batch_size // args.micro_rollout_batch_size)
-            rewards = torch.cat([exp.info["reward"] for exp in experiences])
-            rewards = rewards.reshape(-1, group_size)
-            baseline = rewards.mean(-1, keepdim=True)
-            rewards = (rewards - baseline) / (rewards.std(1, keepdim=True) + 1e-8)
-            rewards = rewards.flatten().chunk(len(experiences))
-            return experiences, rewards
-        elif args.advantage_estimator == "reinforce_baseline":
-            rewards = torch.cat([exp.info["reward"] for exp in experiences])
-            rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
-            rewards = rewards - rewards.mean(-1, keepdim=True)
-            rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
-            return experiences, rewards
-        else:
-            raise ValueError(f"Unhandled advantage_estimator: {args.advantage_estimator}")

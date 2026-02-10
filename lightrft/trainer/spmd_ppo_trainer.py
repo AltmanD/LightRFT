@@ -21,6 +21,7 @@ Key features:
 import time
 
 import torch
+import math
 from tqdm import tqdm
 
 from lightrft.trainer import PPOTrainer, PPOTrainerVL
@@ -31,6 +32,7 @@ from lightrft.utils.trajectory_saver import create_trajectory_saver
 from lightrft.trainer.replay_buffer import make_experience_batch
 from lightrft.trainer.replay_buffer_vl import make_experience_batch as make_experience_batch_vl
 from lightrft.models.utils import create_high_entropy_mask
+from lightrft.utils.distributed_sampler import DistributedSampler
 from lightrft.utils import init_logger
 
 logger = init_logger(__name__)
@@ -692,6 +694,7 @@ class SPMDPPOTrainerVL(SPMDPPOTrainerBase, PPOTrainerVL):
         SPMDPPOTrainerBase.__init__(self, *args, VLM=True, **kwargs)
         if self.args.use_partial:
             # Replace experience maker with partial version
+            processor = kwargs.pop("processor", None)
             self.experience_maker = PartialFastExperienceMaker(
                 self.actor,
                 self.critic,
@@ -706,7 +709,7 @@ class SPMDPPOTrainerVL(SPMDPPOTrainerBase, PPOTrainerVL):
                 self.reward_fn_label_map,
                 self.reward_recipe,
                 packing_samples=self.packing_samples,
-                processor=self._processor,
+                processor=processor,
                 partial_percent=getattr(self.args, "partial_percent", 0.7),
                 max_token_budget=getattr(self.args, "max_token_budget", 1024),
             )
@@ -735,27 +738,60 @@ class SPMDPPOTrainerVL(SPMDPPOTrainerBase, PPOTrainerVL):
                 if self.experience_maker.need_new_prompts(self.args.rollout_batch_size, self.micro_rollout_batch_size):
                     try:
                         # Get next batch of prompts, images, references, and labels
-                        rand_prompts, rand_images, rand_references, rand_labels = next(dataloader_iter)
+                        batch = next(dataloader_iter)
+                        # Handle variable batch size (4 or 5 elements)
+                        if len(batch) == 5:
+                            rand_prompts, rand_images, rand_videos, rand_references, rand_labels = batch
+                        else:
+                            rand_prompts, rand_images, rand_references, rand_labels = batch
+                            rand_videos = None
                     except StopIteration:
                         # End of epoch reached
                         break
 
                     # Generate experiences from new prompts
                     experiences = self.experience_maker.make_experience_list(
-                        rand_prompts, rand_images, rand_references, rand_labels, **self.generate_kwargs
+                        rand_prompts, rand_images, rand_videos, rand_references, rand_labels,
+                        **self.generate_kwargs
                     )
                 else:
                     # Generate experiences from cached prompts
                     experiences = self.experience_maker.make_experience_list(
-                        None, None, None, None, **self.generate_kwargs
+                        None, None, None, None, None, **self.generate_kwargs
                     )
                 yield experiences
         else:
             # Non-partial rollout logic
-            for rand_prompts, rand_images, rand_references, rand_labels in dataloader:
-                experiences = self.experience_maker.make_experience_list(
-                    rand_prompts, rand_images, rand_references, rand_labels, **self.generate_kwargs
+            for batch in dataloader:
+                # Compatible with both image-only (4 args) and video (5 args) dataloaders
+                if len(batch) == 5:
+                    rand_prompts, rand_images, rand_videos, rand_references, rand_labels = batch
+                else:
+                    rand_prompts, rand_images, rand_references, rand_labels = batch
+                    rand_videos = None
+
+                # TODO: Remove debug print
+                self.strategy.print(
+                    f"rand_prompts:\n {rand_prompts}\n , rand_images:{rand_images}\n , rand_references:{rand_references}\n, rand_labels:{rand_labels}\n "  # noqa
                 )
+
+                experiences = self.experience_maker.make_experience_list(
+                    rand_prompts, rand_images, rand_videos, rand_references, rand_labels,
+                    **self.generate_kwargs
+                )
+
+                # Debug print for first experience
+                for i, experience in enumerate(experiences):
+                    if i == 0:
+                        output = self.tokenizer.batch_decode(
+                            experience.sequences[0].unsqueeze(0), skip_special_tokens=True
+                        )
+                        self.strategy.print("collect phase: experience.sequences w skip_special_tokens: ", output)
+                        self.strategy.print(
+                            f"collect phase: rand_prompts:\n {rand_prompts[0:2]}\n , rand_images:{rand_images[0:2]}\n , rand_references:{rand_references[0:2]}\n, rand_labels:{rand_labels[0:2]}\n "  # noqa
+                        )
+                    break
+
                 yield experiences
 
     def _process_experiences_and_train(self, experiences, steps):
@@ -789,6 +825,88 @@ class SPMDPPOTrainerVL(SPMDPPOTrainerBase, PPOTrainerVL):
         # Report memory usage after replay buffer is filled
         self.strategy.report_memory('after replay_buffer ready')
         
+        # Aggregate rollout statistics from replay buffer
+        # Collect metrics from the rollout/collection phase
+        rollout_status = {}
+        if self.replay_buffer.items:
+            all_rewards = []
+            all_format_rewards = []
+            all_accuracy_rewards = []
+            all_response_lengths = []
+
+            for item in self.replay_buffer.items:
+                # Collect rewards from rollout
+                if hasattr(item, 'info') and item.info is not None and 'reward' in item.info:
+                    all_rewards.append(item.info['reward'])
+
+                # Robust handling of reward_metrics
+                # 1. Check if info exists
+                # 2. Check if 'reward_metrics' key exists
+                # 3. Check if reward_metrics is not None (critical!)
+                if (
+                    hasattr(item, 'info') and item.info is not None and 'reward_metrics' in item.info
+                    and item.info['reward_metrics'] is not None
+                ):
+
+                    reward_metrics = item.info['reward_metrics']
+
+                    # Safely extract sub-metrics
+                    if 'format_reward' in reward_metrics:
+                        all_format_rewards.append(reward_metrics['format_reward'])
+                    if 'accuracy_reward' in reward_metrics:
+                        all_accuracy_rewards.append(reward_metrics['accuracy_reward'])
+
+                # Collect response lengths from rollout
+                if hasattr(item, 'info') and item.info is not None and 'response_length' in item.info:
+                    all_response_lengths.append(item.info['response_length'])
+
+            # Compute rollout statistics
+            device = torch.cuda.current_device()
+
+            if all_rewards:
+                # [TENSOR-FIX] Handle both tensor lists and scalar lists
+                if isinstance(all_rewards[0], torch.Tensor):
+                    rewards_tensor = torch.cat([t.to(device).float() for t in all_rewards])
+                else:
+                    rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32, device=device)
+                rollout_status["rollout_reward"] = rewards_tensor.mean().item()
+                rollout_status["rollout_reward_std"] = rewards_tensor.std().item()
+
+            if all_format_rewards:
+                # [TENSOR-FIX] Handle both tensor lists and scalar lists
+                if isinstance(all_format_rewards[0], torch.Tensor):
+                    format_tensor = torch.cat([t.to(device).float() for t in all_format_rewards])
+                else:
+                    format_tensor = torch.tensor(all_format_rewards, dtype=torch.float32, device=device)
+
+                mean_format_reward = format_tensor.mean().item()
+
+                # Only display if mean is significantly non-zero
+                if abs(mean_format_reward) > 1e-6:
+                    rollout_status["rollout_format_reward"] = mean_format_reward
+
+            if all_accuracy_rewards:
+                # [TENSOR-FIX] Handle both tensor lists and scalar lists
+                if isinstance(all_accuracy_rewards[0], torch.Tensor):
+                    accuracy_tensor = torch.cat([t.to(device).float() for t in all_accuracy_rewards])
+                else:
+                    accuracy_tensor = torch.tensor(all_accuracy_rewards, dtype=torch.float32, device=device)
+
+                mean_accuracy_reward = accuracy_tensor.mean().item()
+
+                # Only display if mean is significantly non-zero
+                if abs(mean_accuracy_reward) > 1e-6:
+                    rollout_status["rollout_accuracy_reward"] = mean_accuracy_reward
+
+            if all_response_lengths:
+                # [TENSOR-FIX] Handle both tensor lists and scalar lists
+                if isinstance(all_response_lengths[0], torch.Tensor):
+                    lengths_tensor = torch.cat([t.to(device).float() for t in all_response_lengths])
+                else:
+                    lengths_tensor = torch.tensor(all_response_lengths, dtype=torch.float32, device=device)
+
+                rollout_status["rollout_response_length"] = lengths_tensor.mean().item()
+
         # Normalize advantages if not using group normalization
         if self.args.advantage_estimator != "group_norm":
             self.replay_buffer.normalize("advantages", self.strategy)
@@ -806,87 +924,104 @@ class SPMDPPOTrainerVL(SPMDPPOTrainerBase, PPOTrainerVL):
         if "kl" in status:
             self.kl_ctl.update(status["kl"], self.args.rollout_batch_size * self.args.n_samples_per_prompt)
         
-        return status
+        # Merge rollout status and training status
+        merged_status = {**rollout_status, **status}
+        return merged_status
 
     def fit(
         self,
         args,
         prompts_dataloader,
         pretrain_dataloader,
+        eval_dataloader=None,
         consumed_samples=0,
         num_update_steps_per_episodes=1,
     ) -> None:
         """
-        Execute the main training loop for vision-language models using SPMD PPO.
+        Main training loop for PPO.
 
-        This method orchestrates the complete training process including:
-        1. Rollout phase: Generate experiences by interacting with the environment
-        2. Training phase: Update actor and critic models using collected experiences
-        3. Evaluation and checkpointing: Save models and logs at specified intervals
-
-        The training loop follows the standard PPO pattern with distributed data
-        parallelism for efficient multi-device training. It handles both
-        image-text prompts and pre-training data for mixed objective optimization.
-
-        :param args: Training configuration arguments containing hyperparameters like num_episodes, rollout_batch_size, n_samples_per_prompt, etc.
-        :type args: argparse.Namespace
-        :param prompts_dataloader: DataLoader providing image-text prompts for training
-        :type prompts_dataloader: torch.utils.data.DataLoader
-        :param pretrain_dataloader: DataLoader providing pre-training data for supervised fine-tuning
-        :type pretrain_dataloader: torch.utils.data.DataLoader
-        :param consumed_samples: Number of samples already processed (for resuming training)
+        :param args: Training arguments.
+        :type args: Namespace
+        :param prompts_dataloader: DataLoader for prompt data.
+        :type prompts_dataloader: DataLoader
+        :param pretrain_dataloader: DataLoader for pre-training data.
+        :type pretrain_dataloader: DataLoader
+        :param eval_dataloader: DataLoader for evaluation data, defaults to None.
+        :type eval_dataloader: DataLoader, optional
+        :param consumed_samples: Number of samples already consumed, defaults to 0.
         :type consumed_samples: int
-        :param num_update_steps_per_episodes: Number of update steps per training episode
+        :param num_update_steps_per_episodes: Number of update steps per episode, defaults to 1.
         :type num_update_steps_per_episodes: int
-        :return: None
+        """
+        # Determine if using partial rollout
+        use_partial = getattr(self.args, 'use_partial', False)
 
-        Example::
+        # Calculate samples per rollout and per training iteration
+        samples_per_rollout = args.rollout_batch_size * args.n_samples_per_prompt
+        samples_per_train = args.train_batch_size * args.n_samples_per_prompt
 
-            trainer.fit(
-                args=training_args,
-                prompts_dataloader=image_prompt_loader,
-                pretrain_dataloader=pretrain_loader,
-                consumed_samples=0,
-                num_update_steps_per_episodes=4
+        # Print training mode information
+        if args.train_batch_size < args.rollout_batch_size:
+            updates_per_rollout = samples_per_rollout / samples_per_train
+            self.strategy.print(
+                f"\n{'=' * 80}\n"
+                f"HIGH FREQUENCY UPDATE MODE: train_batch_size ({args.train_batch_size}) < rollout_batch_size ({args.rollout_batch_size})\n"  # noqa
+                f"{'=' * 80}\n"
+                f"Behavior:\n"
+                f"  - Each rollout generates {samples_per_rollout} samples.\n"
+                f"  - Each rollout will trigger {updates_per_rollout:.2f} optimizer updates.\n"
+                f"  - Total updates will be HIGHER than standard mode for the same amount of data.\n"
+                f"{'=' * 80}\n"
+            )
+        elif args.train_batch_size > args.rollout_batch_size:
+            self.strategy.print(
+                f"\n{'=' * 80}\n"
+                f"ACCUMULATION MODE: train_batch_size ({args.train_batch_size}) > rollout_batch_size ({args.rollout_batch_size})\n"  # noqa
+                f"{'=' * 80}\n"
+                f"Behavior:\n"
+                f"  - Multiple rollouts needed for one update.\n"
+                f"{'=' * 80}\n"
             )
 
-        .. note:: Distributed Training
-            This method handles distributed data parallelism automatically using
-            DistributedSampler when available. Each rank processes a different
-            subset of the data.
+        # Calculate number of rollouts per episode.
+        # Regardless of TBS and RBS relationship, rollout count should be determined by "total data / rollout size".
+        # Numerator (num_update_steps * train_batch_size) equals "total samples planned for this episode".
+        # Denominator (rollout_batch_size * n_samples) equals "samples produced per rollout".
+        # This calculation ensures data collection volume is constant.
+        # When TBS=64, num_update_steps is naturally twice as large as when TBS=128.
+        # Substituting into formula: (2N * 0.5T) / R = (N * T) / R.
+        # Conclusion: Rollout count unchanged, but internal update loop count doubles due to smaller TBS.
 
-        .. warning:: Memory Management
-            The method includes explicit memory reporting and cache clearing
-            to manage GPU memory efficiently during training.
-        """
-        # Calculate number of rollouts per episode based on batch sizes and epochs
         num_rollouts_per_episodes = (
-            num_update_steps_per_episodes
-            * args.train_batch_size
-            // args.max_epochs
-            // args.rollout_batch_size
-            // args.n_samples_per_prompt
+            num_update_steps_per_episodes * args.train_batch_size // args.max_epochs // args.rollout_batch_size //
+            args.n_samples_per_prompt
         )
 
-        # Configure evaluation and checkpointing intervals
-        # If eval_steps is -1, evaluate once per epoch
-        if args.eval_steps == -1:
-            args.eval_steps = num_rollouts_per_episodes
-        # If save_steps is -1, disable checkpoint saving
-        if args.save_steps == -1:
-            args.save_steps = float("inf")
+        # Safeguard to prevent num_rollouts_per_episodes from being 0
+        if num_rollouts_per_episodes == 0:
+            # Try recalculating with ceil to prevent fractional values from being discarded by integer division
+            val = (num_update_steps_per_episodes *
+                   args.train_batch_size) / (args.max_epochs * args.rollout_batch_size * args.n_samples_per_prompt)
+            num_rollouts_per_episodes = math.ceil(val)
 
-        # Store data loaders for access throughout training
+            if num_rollouts_per_episodes == 0:
+                self.strategy.print("[WARNING] Calculated num_rollouts_per_episodes is 0. Forcing to 1.")
+                num_rollouts_per_episodes = 1
+
+        # Get eval and save steps
+        if args.eval_steps == -1:
+            args.eval_steps = num_rollouts_per_episodes  # Evaluate once per epoch
+        if args.save_steps == -1:
+            args.save_steps = float("inf")  # Do not save checkpoint
+
         self.prompts_dataloader = prompts_dataloader
         self.pretrain_dataloader = pretrain_dataloader
+        self.eval_dataloader = eval_dataloader  # Save for evaluation
 
-        # Calculate starting step and episode for resuming training
+        # Restore step and start_episode
         steps = consumed_samples // args.rollout_batch_size + 1
         start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
         consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
-
-        # Determine if using partial rollout
-        use_partial = getattr(self.args, 'use_partial', False)
 
         # Main training loop over episodes
         for episode in range(start_episode, args.num_episodes):
@@ -903,24 +1038,23 @@ class SPMDPPOTrainerVL(SPMDPPOTrainerBase, PPOTrainerVL):
                 disable=not self.strategy.is_rank_0(),
             )
 
-            # Create experience iterator
+            # Unified training loop using experience iterator
             experience_iterator = self._make_experience_iterator(self.prompts_dataloader, use_partial)
             
             for experiences in experience_iterator:
                 # Process experiences and perform training step
                 status = self._process_experiences_and_train(experiences, steps)
                 
-                # Update progress bar with training status
+                # Update progress bar with training status (includes rollout stats)
                 pbar.set_postfix(status)
 
                 # Save logs and checkpoints at appropriate intervals
                 client_states = {"consumed_samples": steps * args.rollout_batch_size}
-                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
+                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states, episode=episode)
 
                 # Update step counter and progress bar
                 pbar.update()
                 steps = steps + 1
-
         # Clean up monitoring tools
         if self._wandb is not None and self.strategy.is_rank_0():
             self._wandb.finish()
